@@ -16,6 +16,7 @@
 
 package com.google.cloud.storage;
 
+import com.google.api.client.http.HttpHeaders;
 import com.google.api.client.http.HttpResponse;
 import com.google.api.core.InternalApi;
 import com.google.common.hash.Hashing;
@@ -25,6 +26,7 @@ import com.google.common.primitives.Ints;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
+import java.util.Locale;
 import java.util.Map;
 import java.util.function.Supplier;
 
@@ -106,19 +108,27 @@ public final class HttpStorageRpcHasherHelper {
   }
 
   private boolean isTranscoded(HttpResponse response) {
-    com.google.api.client.http.HttpHeaders headers = response.getHeaders();
+    HttpHeaders headers = response.getHeaders();
     String storedEncoding =
         HttpClientContext.firstHeaderValue(headers, "x-goog-stored-content-encoding");
-    String storedLength =
-        HttpClientContext.firstHeaderValue(headers, "x-goog-stored-content-length");
-    return storedEncoding != null || storedLength != null || isDecompressedByClient(response);
+    String encoding = headers.getContentEncoding();
+    // Stored-content headers are also present on untranscoded responses. Only a change in
+    // encoding indicates server-side transcoding; an absent Content-Encoding means identity.
+    return (storedEncoding != null
+            && !storedEncoding.equalsIgnoreCase(encoding == null ? "identity" : encoding))
+        || isDecompressedByClient(response);
   }
 
   private boolean isDecompressedByClient(HttpResponse response) {
     boolean returnRaw = response.getRequest().getResponseReturnRawInputStream();
     if (!returnRaw) {
       String encoding = response.getHeaders().getContentEncoding();
-      return encoding != null && encoding.contains("gzip");
+      if (encoding == null) {
+        return false;
+      }
+      // Match the normalization HttpResponse#getContent uses to decide whether to gunzip.
+      String normalized = encoding.trim().toLowerCase(Locale.ENGLISH);
+      return normalized.equals("gzip") || normalized.equals("x-gzip");
     }
     return false;
   }

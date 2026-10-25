@@ -21,6 +21,7 @@ import static org.junit.Assert.assertThrows;
 
 import com.google.api.client.testing.http.MockLowLevelHttpResponse;
 import com.google.cloud.NoCredentials;
+import com.google.cloud.ReadChannel;
 import com.google.cloud.TransportOptions;
 import com.google.cloud.http.HttpTransportOptions;
 import com.google.cloud.storage.BlobId;
@@ -32,7 +33,10 @@ import com.google.common.collect.ImmutableMap;
 import com.google.common.io.BaseEncoding;
 import com.google.common.primitives.Ints;
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.zip.GZIPOutputStream;
 import org.junit.Test;
 
 public final class HttpStorageRpcChecksumTest {
@@ -55,8 +59,14 @@ public final class HttpStorageRpcChecksumTest {
     MockLowLevelHttpResponse response =
         new MockLowLevelHttpResponse()
             .setContentType("application/octet-stream")
-            .setHeaderNames(ImmutableList.of("x-goog-hash"))
-            .setHeaderValues(ImmutableList.of("crc32c=" + CONTENT_CRC32C_BASE64))
+            .setHeaderNames(
+                ImmutableList.of(
+                    "x-goog-hash",
+                    "x-goog-stored-content-encoding",
+                    "x-goog-stored-content-length"))
+            .setHeaderValues(
+                ImmutableList.of(
+                    "crc32c=" + CONTENT_CRC32C_BASE64, "identity", String.valueOf(CONTENT.length)))
             .setContent(new String(CONTENT, StandardCharsets.UTF_8))
             .setStatusCode(200);
 
@@ -71,8 +81,14 @@ public final class HttpStorageRpcChecksumTest {
     MockLowLevelHttpResponse response =
         new MockLowLevelHttpResponse()
             .setContentType("application/octet-stream")
-            .setHeaderNames(ImmutableList.of("x-goog-hash"))
-            .setHeaderValues(ImmutableList.of("crc32c=" + BAD_CRC32C_BASE64))
+            .setHeaderNames(
+                ImmutableList.of(
+                    "x-goog-hash",
+                    "x-goog-stored-content-encoding",
+                    "x-goog-stored-content-length"))
+            .setHeaderValues(
+                ImmutableList.of(
+                    "crc32c=" + BAD_CRC32C_BASE64, "identity", String.valueOf(CONTENT.length)))
             .setContent(new String(CONTENT, StandardCharsets.UTF_8))
             .setStatusCode(200);
 
@@ -93,8 +109,14 @@ public final class HttpStorageRpcChecksumTest {
     MockLowLevelHttpResponse response =
         new MockLowLevelHttpResponse()
             .setContentType("application/octet-stream")
-            .setHeaderNames(ImmutableList.of("x-goog-hash"))
-            .setHeaderValues(ImmutableList.of("crc32c=" + CONTENT_CRC32C_BASE64))
+            .setHeaderNames(
+                ImmutableList.of(
+                    "x-goog-hash",
+                    "x-goog-stored-content-encoding",
+                    "x-goog-stored-content-length"))
+            .setHeaderValues(
+                ImmutableList.of(
+                    "crc32c=" + CONTENT_CRC32C_BASE64, "identity", String.valueOf(CONTENT.length)))
             .setContent(new String(CONTENT, StandardCharsets.UTF_8))
             .setStatusCode(200);
 
@@ -110,8 +132,14 @@ public final class HttpStorageRpcChecksumTest {
     MockLowLevelHttpResponse response =
         new MockLowLevelHttpResponse()
             .setContentType("application/octet-stream")
-            .setHeaderNames(ImmutableList.of("x-goog-hash"))
-            .setHeaderValues(ImmutableList.of("crc32c=" + BAD_CRC32C_BASE64))
+            .setHeaderNames(
+                ImmutableList.of(
+                    "x-goog-hash",
+                    "x-goog-stored-content-encoding",
+                    "x-goog-stored-content-length"))
+            .setHeaderValues(
+                ImmutableList.of(
+                    "crc32c=" + BAD_CRC32C_BASE64, "identity", String.valueOf(CONTENT.length)))
             .setContent(new String(CONTENT, StandardCharsets.UTF_8))
             .setStatusCode(200);
 
@@ -125,6 +153,65 @@ public final class HttpStorageRpcChecksumTest {
               });
       assertThat(ex.getMessage()).contains("Mismatch checksum value");
       assertThat(ex.getCause().getMessage()).contains("Mismatch checksum value");
+    }
+  }
+
+  @Test
+  public void testReader_storedContentHeaders_failedCrc32cValidation() throws Exception {
+    MockLowLevelHttpResponse response =
+        new MockLowLevelHttpResponse()
+            .setContentType("application/octet-stream")
+            .addHeader("x-goog-hash", "crc32c=" + BAD_CRC32C_BASE64)
+            .addHeader("x-goog-stored-content-encoding", "identity")
+            .addHeader("x-goog-stored-content-length", String.valueOf(CONTENT.length))
+            .addHeader("Content-Length", String.valueOf(CONTENT.length))
+            .addHeader("x-goog-generation", "12345")
+            .setContent(CONTENT)
+            .setStatusCode(200);
+
+    try (Storage storage = createMockStorage(response);
+        ReadChannel reader = storage.reader(BlobId.of(BUCKET, BLOB))) {
+      ByteBuffer buffer = ByteBuffer.allocate(4096);
+      IOException ex =
+          assertThrows(
+              IOException.class,
+              () -> {
+                while (reader.read(buffer) != -1) {
+                  buffer.clear();
+                }
+              });
+      assertThat(ex.getMessage()).contains("Mismatch checksum value");
+    }
+  }
+
+  @Test
+  public void testReadAllBytes_upperCaseGzipDecompressedByClient_skipsCrc32cValidation()
+      throws Exception {
+    ByteArrayOutputStream gzipped = new ByteArrayOutputStream();
+    try (GZIPOutputStream gz = new GZIPOutputStream(gzipped)) {
+      gz.write(CONTENT);
+    }
+    byte[] stored = gzipped.toByteArray();
+    String storedCrc32cBase64 =
+        BaseEncoding.base64()
+            .encode(
+                Ints.toByteArray(
+                    com.google.common.hash.Hashing.crc32c().hashBytes(stored).asInt()));
+    // The crc32c describes the stored gzip bytes, but the client returns them decompressed.
+    MockLowLevelHttpResponse response =
+        new MockLowLevelHttpResponse()
+            .setContentType("text/plain")
+            .addHeader("x-goog-hash", "crc32c=" + storedCrc32cBase64)
+            .addHeader("x-goog-stored-content-encoding", "GZIP")
+            .addHeader("x-goog-stored-content-length", String.valueOf(stored.length))
+            .addHeader("Content-Encoding", "GZIP")
+            .setContentEncoding("GZIP")
+            .setContent(stored)
+            .setStatusCode(200);
+
+    try (Storage storage = createMockStorage(response)) {
+      byte[] bytes = storage.readAllBytes(BlobId.of(BUCKET, BLOB));
+      assertThat(bytes).isEqualTo(CONTENT);
     }
   }
 
